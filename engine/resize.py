@@ -1,33 +1,6 @@
-
 """
-CHAMELEON engine — reflow, not stretch.
-
-Approach (no ML model, fully deterministic, runs offline in milliseconds):
-
-1. CLASSIFY every element from geometry alone (no semantic labels needed):
-   - background : a full-bleed image (covers most of the canvas)  -> fills the new canvas
-   - decoration : low-opacity / partly off-canvas ungrouped shapes, or images whose
-                  asset file is missing -> re-anchored to the nearest corner, scaled
-   - content    : everything else. Elements sharing a group_id move as ONE rigid
-                  unit (a button = its shape + its label), so groups never break.
-
-2. RANK content blocks by importance (headline = biggest type, hero image = biggest
-   image, CTA = short text on a filled shape, legal = smallest type, ...).
-
-3. SEARCH LAYOUTS. Content blocks are kept in their original reading order and
-   split into 1..N side-by-side columns (contiguous partitions). For each candidate
-   we binary-search the largest uniform scale k at which every column fits:
-   images keep their aspect ratio, text is re-wrapped with real font metrics at
-   the new column width. The layout with the best scale wins (fewer columns win ties).
-   Tall canvases naturally choose 1 column, wide banners choose 3-4.
-
-4. GRACEFUL DROP. If even the best layout would push text below a readable size
-   (extreme ratios like 728x90), the lowest-priority blocks (legal, watermark,
-   badges, long body copy) are collapsed one at a time: they stay in the output
-   with their ids (as the rules require) but become invisible (opacity 0, 1px,
-   tucked in a corner). The headline, CTA, logo and hero are never dropped.
-
-5. Everything is clamped inside the canvas, ids/fonts/content are untouched.
+Chameleon engine resizing
+Adapts layouts to different canvas sizes while preserving design elements.
 """
 
 from __future__ import annotations
@@ -41,11 +14,11 @@ from typing import Any
 
 LINE_HEIGHT = 1.2
 _MIN_PX = [10.0]
+_CANVAS = [1e9, 1e9]
 _IMG_BOOST = [1.0]  # pictures may outgrow the type scale on very wide banners
 
-# --------------------------------------------------------------------------
 # Text measurement (real brand-font metrics via Pillow, with a safe fallback)
-# --------------------------------------------------------------------------
+
 _FONT_DIRS = [Path("brand_kit/fonts"), Path(__file__).resolve().parent.parent / "brand_kit" / "fonts"]
 _ASSET_DIRS = [Path("brand_kit/assets"), Path(__file__).resolve().parent.parent / "brand_kit" / "assets"]
 _font_cache: dict = {}
@@ -158,6 +131,36 @@ def _text_height(el: dict, size: float, max_w: float) -> tuple[float, float]:
     return n * size * lh, widest
 
 
+_vis_cache: dict = {}
+
+
+def _visible_frac(e: dict):
+    """Where the visible (non-transparent) artwork sits inside an image element's box,
+    as fractions (x0, y0, x1, y1). Many brand assets carry wide transparent padding;
+    laying out by the box instead of the art makes spacing look random."""
+    key = (e.get("asset_id"), round(e["width"], 1), round(e["height"], 1), e.get("fit", "contain"))
+    if key in _vis_cache:
+        return _vis_cache[key]
+    frac = (0.0, 0.0, 1.0, 1.0)
+    try:
+        from PIL import Image
+        path = next((d / e["asset_id"] for d in _ASSET_DIRS if (d / e["asset_id"]).exists()), None)
+        if path is not None and e.get("fit", "contain") != "cover":
+            im = Image.open(path)
+            aw, ah = im.size
+            bb = im.getchannel("A").getbbox() if "A" in im.getbands() else im.getbbox()
+            if bb:
+                bw, bh = float(e["width"]), float(e["height"])
+                c = min(bw / aw, bh / ah)  # contain fit
+                ox, oy = (bw - aw * c) / 2, (bh - ah * c) / 2
+                frac = ((ox + bb[0] * c) / bw, (oy + bb[1] * c) / bh,
+                        (ox + bb[2] * c) / bw, (oy + bb[3] * c) / bh)
+    except Exception:
+        pass
+    _vis_cache[key] = frac
+    return frac
+
+
 def _asset_exists(asset_id: str) -> bool:
     for d in _ASSET_DIRS:
         if (d / asset_id).exists():
@@ -166,9 +169,8 @@ def _asset_exists(asset_id: str) -> bool:
     return not any(d.exists() for d in _ASSET_DIRS)
 
 
-# --------------------------------------------------------------------------
 # Classification
-# --------------------------------------------------------------------------
+
 def _area(e):
     return max(0.0, e["width"]) * max(0.0, e["height"])
 
@@ -196,6 +198,9 @@ class Block:
         self.flow_text = (not self.is_group) and len(self.texts) == 1
         self.priority = 5.0
         self.tf = 1.0  # extra type scale for reflowing text (extreme ratios)
+        self.vis = None
+        if len(els) == 1 and els[0]["type"] == "image":
+            self.vis = _visible_frac(els[0])
         self.dropped = False
         self.cw, self.ch = src_canvas
 
@@ -251,6 +256,15 @@ def _classify(source: dict):
     blocks = [Block(g, (cw, ch)) for g in content] + [Block(g, (cw, ch)) for g in groups.values()]
     _rank(blocks, cw, ch)
     blocks.sort(key=lambda b: (round((b.y + b.h / 2) / (ch * 0.04)), b.x))  # reading order
+    # small badges / pills ("NEW FLAVOR") describe the product: keep them next to the hero image
+    hero = next((b for b in blocks if b.images and not b.texts and b.priority == 8.0), None)
+    if hero is not None:
+        pills = [b for b in blocks if b.is_group and b.texts and b.shapes and b.priority == 3.5
+                 and not any(abs(e.get("rotation", 0) or 0) > 1 for e in b.els)]
+        if pills and len(pills) <= 2:
+            rest = [b for b in blocks if b not in pills]
+            i = rest.index(hero)
+            blocks = rest[:i] + pills + rest[i:]
     return bgs, decos, blocks
 
 
@@ -296,9 +310,8 @@ def _rank(blocks: list[Block], cw, ch):
         b.priority = p
 
 
-# --------------------------------------------------------------------------
 # Layout search
-# --------------------------------------------------------------------------
+
 def _block_size(b: Block, k: float, col_w: float, max_h: float = 1e9):
     """Size of block at scale k inside a column of width col_w (or None if it can't fit)."""
     if b.flow_text:
@@ -316,8 +329,11 @@ def _block_size(b: Block, k: float, col_w: float, max_h: float = 1e9):
         return widest + pad, h + fs * 0.25, k
     if b.images and not b.texts and not b.shapes:
         # pictures shrink independently to fit the band (keeps proportion)
-        s_ = min(k * _IMG_BOOST[0], max_h / max(b.h, 1))
-        return b.w * s_, b.h * s_, s_
+        v = b.vis or (0.0, 0.0, 1.0, 1.0)
+        vw, vh = max(v[2] - v[0], 0.05), max(v[3] - v[1], 0.05)
+        s_ = min(k * _IMG_BOOST[0], max_h / max(b.h * vh, 1),
+                 _CANVAS[1] / max(b.h, 1), _CANVAS[0] / max(b.w, 1))
+        return b.w * vw * s_, b.h * vh * s_, s_
     # rigid groups (buttons, pills) may also grow past the type scale on banners
     # ...but only as far as needed to make their labels readable (hierarchy stays intact)
     need = (_MIN_PX[0] * 1.15) / max(min([t["font_size"] for t in b.texts] or [1e9]), 1e-6)
@@ -338,6 +354,15 @@ def _block_size(b: Block, k: float, col_w: float, max_h: float = 1e9):
     return w, h, k
 
 
+def _edge_overflow(col, sizes, col_w, margin):
+    """How far an image's transparent padding pokes out of its column, beyond the margin."""
+    o = 0.0
+    for b, sz in zip(col, sizes):
+        if b.vis is not None:
+            o = max(o, (b.w * sz[2] - col_w) / 2 - margin)
+    return max(0.0, o)
+
+
 def _fits(cols, k, W, H, gap, margin):
     """Check a column partition at scale k. Returns placement or None."""
     avail_w = W - 2 * margin - gap * (len(cols) - 1)
@@ -347,13 +372,22 @@ def _fits(cols, k, W, H, gap, margin):
     # fixed width per column = widest rigid block; flexible text gets remaining share
     fixed = []
     for col in cols:
-        fw = max([(b.w * min(k * _IMG_BOOST[0], avail_h / max(b.h, 1)) if (b.images and not b.texts and not b.shapes)
+        fw = max([(_block_size(b, k, 1e9, avail_h)[0] if (b.images and not b.texts and not b.shapes)
                    else b.w * max(k, min(k * 2.5, avail_h / max(b.h, 1),
                                          (_MIN_PX[0] * 1.15) / max(min([t["font_size"] for t in b.texts] or [1e9]), 1e-6))))
                   for b in col if not b.flow_text] or [0])
         fixed.append(fw)
     flex_cols = [i for i, col in enumerate(cols) if any(b.flow_text for b in col)]
     rest = avail_w - sum(fixed[i] for i in range(len(cols)) if i not in flex_cols)
+    # reserve canvas room for the outer columns' image padding before text claims it
+    def _pre_over(col, fw_):
+        o = 0.0
+        for b in col:
+            if b.vis is not None and not b.flow_text:
+                sz = _block_size(b, k, 1e9, avail_h)
+                o = max(o, (b.w * sz[2] - max(fw_, sz[0])) / 2 - margin)
+        return max(0.0, o)
+    rest -= _pre_over(cols[0], fixed[0]) + (_pre_over(cols[-1], fixed[-1]) if len(cols) > 1 else 0.0)
     widths = list(fixed)
     if flex_cols:
         # give text columns a share proportional to their text mass
@@ -379,6 +413,12 @@ def _fits(cols, k, W, H, gap, margin):
         if total_h > avail_h + 0.5:
             return None
         placed_cols.append((cw_, sizes, total_h))
+    # the outer columns must leave room on the canvas for their images' invisible padding
+    cw0 = [min(c, max(s[0] for s in sz) + 4) for c, (_, sz, _) in zip(widths, placed_cols)]
+    o_l = _edge_overflow(cols[0], placed_cols[0][1], cw0[0], margin)
+    o_r = _edge_overflow(cols[-1], placed_cols[-1][1], cw0[-1], margin)
+    if sum(cw0) + o_l + o_r > avail_w + 1:
+        return None
     return widths, placed_cols
 
 
@@ -453,15 +493,17 @@ def _min_readable(W, H):
     return max(10.0, min(W, H) * 0.018)
 
 
-# --------------------------------------------------------------------------
 # Placement
-# --------------------------------------------------------------------------
+
 def _place(b: Block, x, y, w, h, k, out: dict):
     if b.flow_text:
         t = out[b.texts[0]["id"]]
         t["x"], t["y"], t["width"], t["height"] = x, y, w, h
         t["font_size"] = max(1.0, round(t["font_size"] * k * b.tf, 2))
         return
+    if b.vis is not None:
+        x -= b.vis[0] * b.w * k
+        y -= b.vis[1] * b.h * k
     for e in b.els:
         o = out[e["id"]]
         o["x"] = x + (e["x"] - b.x) * k
@@ -591,9 +633,10 @@ def _reflow(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, 
     min_px = _min_readable(W, H)
     _IMG_BOOST[0] = 2.0 if W / H >= 3 else 1.0
     _MIN_PX[0] = min_px
+    _CANVAS[0], _CANVAS[1] = W, H
     active = list(blocks)
 
-    def evaluate(act, tfac):
+    def evaluate(act, tfac, relaxed=False):
         for b in act:
             b.tf = tfac if b.flow_text else 1.0
         res = _best_layout(act, W, H, cap)
@@ -607,10 +650,44 @@ def _reflow(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, 
                     scale[id(b)] = sz[2] * (b.tf if b.flow_text else 1.0)
         fonts = [t["font_size"] * scale.get(id(b), k_ * b.tf) for b in act for t in b.texts]
         head = [t["font_size"] * scale.get(id(b), k_ * b.tf) for b in act for t in b.texts if b.priority >= 10]
-        ok_ = (not fonts or min(fonts) >= min_px)
+        if relaxed:
+            # restoring secondary content: key text keeps the full bar, the rest needs >= 8px
+            sec_px = max(8.0, 0.8 * min_px)
+            ok_ = all(t["font_size"] * scale.get(id(b), k_ * b.tf) >= (min_px if b.priority >= 8 else sec_px)
+                      for b in act for t in b.texts)
+        else:
+            ok_ = (not fonts or min(fonts) >= min_px)
         if head and fonts:
             ok_ = ok_ and max(head) >= 0.9 * max(fonts)  # headline must stay the loudest text
         return res, ok_, (k_ * (0.85 + 0.15 * tfac) if ok_ else min(fonts or [0]))
+
+    def search(act, relaxed=False):
+        best_ = None
+        for tfac in (1.0, 0.85, 0.7, 0.55, 0.45, 0.35):
+            res, ok_, score = evaluate(act, tfac, relaxed)
+            if res is None:
+                continue
+            if best_ is None or (ok_, score) > (best_[1], best_[2]):
+                best_ = (res, ok_, score, tfac)
+        return best_
+
+    def hero_px(act, best_):
+        # size of the loudest key text (headline / CTA) in a chosen layout
+        res, _, _, tfac = best_
+        k_ = res[0]
+        scale = {}
+        if res[2] is not None:
+            for col, (_, sizes, _) in zip(res[1], res[2][1]):
+                for b, sz in zip(col, sizes):
+                    scale[id(b)] = sz[2] * (tfac if b.flow_text else 1.0)
+        widths = {}
+        if res[2] is not None:
+            for col, (_, sizes, _) in zip(res[1], res[2][1]):
+                for b, sz in zip(col, sizes):
+                    widths[id(b)] = sz[0]
+        px = max([t["font_size"] * scale.get(id(b), k_) for b in act for t in b.texts if b.priority >= 10] or [0])
+        wd = max([widths.get(id(b), 0) for b in act if b.priority >= 10] or [0])
+        return px, wd
 
     result = None
     while True:
@@ -634,6 +711,27 @@ def _reflow(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, 
         victim = min(droppable, key=lambda b: (b.priority, -b.y))
         victim.dropped = True
         active.remove(victim)
+
+    # restore: hide only what truly can't fit. Try to bring each dropped unit back, most
+    # important first; keep it if its text can be >= 8px and the headline / CTA lose
+    # no more than 10% of their size or line length.
+    dropped = [b for b in blocks if b.dropped]
+    if result is not None and dropped and ok:
+        order = {id(b): i for i, b in enumerate(blocks)}
+        cur = search(active)
+        base_hero = hero_px(active, cur) if cur else (0, 0)
+        for cand in sorted(dropped, key=lambda b: (-b.priority, b.y)):
+            trial = sorted(active + [cand], key=lambda b: order[id(b)])
+            got = search(trial, relaxed=True)
+            hp = hero_px(trial, got) if got is not None else (0, 0)
+            # headline keeps >= 90% of its size AND its line length (no squeezing into a column)
+            if got is not None and got[1] and hp[0] >= 0.9 * base_hero[0] and hp[1] >= 0.9 * base_hero[1]:
+                cand.dropped = False
+                active = trial
+                cur = got
+        for b in active:
+            b.tf = cur[3] if b.flow_text else 1.0
+        result = cur[0]
 
     # fill: if the chosen layout leaves the canvas mostly empty, let content grow
     if result is not None and _IMG_BOOST[0] == 1.0:
@@ -662,8 +760,18 @@ def _reflow(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, 
         total_w = sum(widths) + gap * (len(cols) - 1)
         # distribute leftover horizontal space evenly between/around columns
         free_w = W - 2 * margin - total_w
-        extra = free_w / (len(cols) + 1) if len(cols) > 1 else free_w / 2
-        x = margin + extra
+        # even gaps between columns, capped so the composition stays a tight group;
+        # whatever is left over becomes equal outer margins (group is centred)
+        o_l = _edge_overflow(cols[0], placed_cols[0][1], widths[0], margin)
+        o_r = _edge_overflow(cols[-1], placed_cols[-1][1], widths[-1], margin)
+        if len(cols) > 1:
+            extra = min(free_w / (len(cols) + 1), max(gap * 1.5, W * 0.03),
+                        max(0.0, (free_w - o_l - o_r) / (len(cols) - 1)))
+            rest_ = free_w - extra * (len(cols) - 1)
+        else:
+            extra, rest_ = 0.0, free_w
+        lead = min(max(rest_ / 2, o_l), max(o_l, rest_ - o_r))
+        x = margin + lead
         for col, (col_w, sizes, total_h) in zip(cols, placed_cols):
             # vertical: spread blocks across available height (designed breathing room)
             avail_h = H - 2 * margin
@@ -686,6 +794,20 @@ def _reflow(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, 
                 y += bh + inner
             x += col_w + gap + extra
 
+    # images whose transparent padding would poke past the canvas edge are shrunk about
+    # their own centre (never shoved sideways into a neighbour); proportions are kept
+    for b in blocks:
+        if b.vis is None or b.dropped:
+            continue
+        o = out[b.els[0]["id"]]
+        cx, cy = o["x"] + o["width"] / 2, o["y"] + o["height"] / 2
+        f = min(1.0, 2 * cx / max(o["width"], 1e-6), 2 * (W - cx) / max(o["width"], 1e-6),
+                2 * cy / max(o["height"], 1e-6), 2 * (H - cy) / max(o["height"], 1e-6))
+        if f < 1.0:
+            f *= 0.999
+            o["width"], o["height"] = o["width"] * f, o["height"] * f
+            o["x"], o["y"] = cx - o["width"] / 2, cy - o["height"] / 2
+
     # 3) decorations: anchor to nearest corner, keep proportion, stay on canvas
     for e in decos:
         o = out[e["id"]]
@@ -707,4 +829,3 @@ def _reflow(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, 
 
     elements = [out[e["id"]] for e in source["elements"]]
     return {"canvas": {"width": target_canvas["width"], "height": target_canvas["height"]}, "elements": elements}
-

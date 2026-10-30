@@ -85,6 +85,18 @@ def soft_warnings(source: dict, output: dict, min_px: float = 10.0) -> list[str]
         if widest > o["width"] + 2:
             warns.append(f"{o['id']}: a word is wider than its box (would be cut off)")
 
+    def art(o):
+        # images are judged by their visible artwork, not their transparent padding
+        if o["type"] != "image":
+            return o["x"], o["y"], o["width"], o["height"]
+        try:
+            from engine.resize import _visible_frac
+            f = _visible_frac(o)
+        except Exception:
+            f = (0.0, 0.0, 1.0, 1.0)
+        return (o["x"] + f[0] * o["width"], o["y"] + f[1] * o["height"],
+                (f[2] - f[0]) * o["width"], (f[3] - f[1]) * o["height"])
+
     def unit(o):
         g = src_by_id[o["id"]].get("group_id")
         return g or o["id"]
@@ -97,8 +109,10 @@ def soft_warnings(source: dict, output: dict, min_px: float = 10.0) -> list[str]
             a, b = vis[i], vis[j]
             if unit(a) == unit(b) or not (solid(a) and solid(b)):
                 continue
-            ix = min(a["x"] + a["width"], b["x"] + b["width"]) - max(a["x"], b["x"])
-            iy = min(a["y"] + a["height"], b["y"] + b["height"]) - max(a["y"], b["y"])
+            ax, ay, aw, ah = art(a)
+            bx, by, bw, bh = art(b)
+            ix = min(ax + aw, bx + bw) - max(ax, bx)
+            iy = min(ay + ah, by + bh) - max(ay, by)
             if ix > 2 and iy > 2:
                 # a label fully on top of a shape is a deliberate pairing
                 inner = a if a["width"] * a["height"] < b["width"] * b["height"] else b

@@ -97,3 +97,42 @@ hosted model, bake its weights into the image during the build step.
 - `chameleon_design_schema_v0.9.json` — full input/output field spec
 - `RULES.md` — what's checked, what's graded, and what disqualifies a submission
 - FAQ — for anything not covered above
+
+
+# CHAMELEON — Resize Engine
+
+Our engine **re-lays-out** a design for a new canvas instead of stretching it. It is deterministic, runs fully offline, uses no AI model, and needs nothing beyond the starter `requirements.txt`.
+
+## Approach (`engine/resize.py`)
+
+1. **Read the design from geometry.** With no labels to go on, it infers each element's role from size, position and type: background, headline, logo, hero image, call to action, fine print. Grouped elements, and text sitting on a shape, move as one unit.
+2. **Lay out by visible artwork.** Images often carry transparent padding, so spacing is measured on what is actually visible, keeping gaps even to the eye.
+3. **Search and score layouts.** It tries splitting the content into 1–5 columns, fits each with the renderer's real font metrics, and scores the candidates like a designer would: larger is better, the headline stays with its subhead, and columns stay balanced. Tall canvases end up stacked; wide banners end up in columns.
+4. **Keep text readable.** No visible text drops below a readable size, and the headline always stays the loudest element.
+5. **Hide only what can't fit.** On extreme shapes such as 728×90, low-priority items (fine print, extra badges) are made invisible when they cannot be shown legibly. They keep their ids, colours and proportions, and each is brought back whenever it fits. The headline, CTA, logo and hero image are never hidden.
+6. **Validate and fall back.** Every result is checked against the hard rules: all ids present, nothing off-canvas, images in proportion, text and fonts unchanged. A safe layout is returned if any check fails, so the engine never crashes.
+
+## How to run
+
+```bash
+pip install -r requirements.txt
+python -m engine.main       # input/*.json -> output/*_output.json + .png
+python -m engine.validate   # rule check report
+```
+
+Docker (PowerShell, all on one line):
+
+```powershell
+docker build --platform linux/amd64 -t my-chameleon-engine .
+docker run --rm --network none -v "${PWD}/input:/app/input" -v "${PWD}/output:/app/output" my-chameleon-engine
+```
+
+## Results and limitations
+
+- **Official samples:** all three pass with 0 hard failures and 0 warnings.
+- **Stress test:** 30 resizes across 10 common formats, with 0 hard failures. Text falls below the readability threshold only on the tiniest formats (160×600, 320×50).
+- **Not guaranteed:** these are local results and do not guarantee performance on hidden designs.
+- **Not yet handled:** text contrast checking, anchoring decorations to the element they sat behind, and preserving left alignment.
+- **Speed:** Level 3 takes roughly 15–50 seconds because of the layout search.
+
+
