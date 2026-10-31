@@ -1,6 +1,5 @@
 """
-Chameleon engine resizing
-Adapts layouts to different canvas sizes while preserving design elements.
+CHAMELEON engine resize module.
 """
 
 from __future__ import annotations
@@ -13,9 +12,13 @@ from pathlib import Path
 from typing import Any
 
 LINE_HEIGHT = 1.2
+# thin strips stay clean: a rotated promo sticker steps aside (set True to tuck it in a corner)
+STICKER_ON_STRIPS = False
 _MIN_PX = [10.0]
 _CANVAS = [1e9, 1e9]
+_RESERVE = [0.0, 0.0]  # canvas width kept free at the left / right edge (corner sticker)
 _IMG_BOOST = [1.0]  # pictures may outgrow the type scale on very wide banners
+
 
 # Text measurement (real brand-font metrics via Pillow, with a safe fallback)
 
@@ -58,6 +61,9 @@ def _get_font(el: dict, size: float):
 _skia = None
 
 
+_char_cache: dict = {}
+
+
 def _skia_width(el, size, s):
     global _skia
     if _skia is None:
@@ -76,7 +82,16 @@ def _skia_width(el, size, s):
     italic = el.get("font_style") == "italic" or el.get("italic") is True
     style = ("bold" if bold else "") + ("italic" if italic else "") or "regular"
     try:
-        return float(sum(cw(fm, el.get("font_family", ""), "bold" if bold else "regular", style, size, s)))
+        # the renderer measures a string as the sum of per-character advances, so caching each
+        # character's advance per font and size gives identical results, far faster
+        fam = el.get("font_family", "")
+        wt = "bold" if bold else "regular"
+        table = _char_cache.setdefault((fam, wt, style, size), {})
+        missing = "".join(sorted(set(s) - table.keys()))
+        if missing:
+            for ch_, w_ in zip(missing, cw(fm, fam, wt, style, size, missing)):
+                table[ch_] = float(w_)
+        return float(sum(table[c] for c in s))
     except Exception:
         return None
 
@@ -198,6 +213,10 @@ class Block:
         self.flow_text = (not self.is_group) and len(self.texts) == 1
         self.priority = 5.0
         self.tf = 1.0  # extra type scale for reflowing text (extreme ratios)
+        self.attach = False
+        self.forced = False   # dropped by a layout rule, never restored
+        self.sticker = None   # promo sticker riding on this product image
+        self.st_scale = 0.0
         self.vis = None
         if len(els) == 1 and els[0]["type"] == "image":
             self.vis = _visible_frac(els[0])
@@ -220,6 +239,8 @@ def _classify(source: dict):
         off = e["x"] < -1 or e["y"] < -1 or e["x"] + e["width"] > cw + 1 or e["y"] + e["height"] > ch + 1
         if e["type"] == "image" and (a >= 0.85 * canvas_area or (e.get("fit") == "cover" and a >= 0.5 * canvas_area)):
             bgs.append(e)
+        elif e["type"] == "shape" and not e.get("group_id") and a >= 0.85 * canvas_area and not e.get("rotation"):
+            bgs.append(e)  # solid-colour background or full-canvas tint: refill the new canvas
         elif e["type"] == "shape" and not e.get("group_id") and (
             e.get("opacity", 1.0) < 0.5 or off or a >= 0.6 * canvas_area
         ):
@@ -230,6 +251,27 @@ def _classify(source: dict):
             groups.setdefault(e["group_id"], []).append(e)
         else:
             content.append([e])
+
+    # matching images side by side (a product pair, a row of icons) keep their arrangement:
+    # similar size, same horizontal band, no group of their own -> one rigid unit
+    imgs = [c[0] for c in content if c[0]["type"] == "image" and _area(c[0]) > 0]
+    used = set()
+    for a_ in imgs:
+        if a_["id"] in used:
+            continue
+        row = [a_]
+        for b_ in imgs:
+            if b_ is a_ or b_["id"] in used:
+                continue
+            ca, cb = a_["y"] + a_["height"] / 2, b_["y"] + b_["height"] / 2
+            if (abs(ca - cb) < 0.08 * ch and 0.8 <= b_["width"] / max(a_["width"], 1e-6) <= 1.25
+                    and 0.8 <= b_["height"] / max(a_["height"], 1e-6) <= 1.25
+                    and all(b_["x"] >= r["x"] + r["width"] or b_["x"] + b_["width"] <= r["x"] for r in row)):
+                row.append(b_)
+        if 2 <= len(row) <= 4:
+            used.update(r["id"] for r in row)
+            groups["__row_" + a_["id"]] = row
+    content = [c for c in content if c[0]["id"] not in used]
 
     # implicit groups: a text label sitting on a filled shape (pill / button / tag) without
     # a group_id is treated as one unit, exactly like an explicit group.
@@ -264,7 +306,9 @@ def _classify(source: dict):
         if pills and len(pills) <= 2:
             rest = [b for b in blocks if b not in pills]
             i = rest.index(hero)
-            blocks = rest[:i] + pills + rest[i:]
+            blocks = rest[:i + 1] + pills + rest[i + 1:]
+            for p_ in pills:
+                p_.attach = True  # layout search strongly prefers keeping it in the hero's column
     return bgs, decos, blocks
 
 
@@ -310,7 +354,31 @@ def _rank(blocks: list[Block], cw, ch):
         b.priority = p
 
 
+# --------------------------------------------------------------------------
 # Layout search
+# --------------------------------------------------------------------------
+def _sticker_box(st, scale):
+    """Axis-aligned footprint of a (possibly rotated) sticker group at a given scale."""
+    a = math.radians(max((abs(e.get("rotation", 0) or 0) for e in st.els), default=0))
+    w, h = st.w * scale, st.h * scale
+    return w * abs(math.cos(a)) + h * abs(math.sin(a)), w * abs(math.sin(a)) + h * abs(math.cos(a))
+
+
+def _group_scale(b: Block, k: float, max_h: float) -> float:
+    """Scale for a rigid group (button, badge). It may grow past the type scale until its
+    label is readable; on banners it is also kept to about a quarter of the canvas width,
+    but never so small that its label drops below the readable size."""
+    min_font = max(min([t["font_size"] for t in b.texts] or [1e9]), 1e-6)
+    banner = _CANVAS[0] / max(_CANVAS[1], 1) >= 3
+    need = (_MIN_PX[0] * (1.0 if banner else 1.15)) / min_font
+    k_g = max(k, min(k * 2.5, max_h / max(b.h, 1), need))
+    if banner:
+        floor = _MIN_PX[0] / min_font
+        k_g = min(k_g, max(0.25 * _CANVAS[0] / max(b.w, 1), floor))
+    if b.priority < 9:  # secondary badges stay quieter than the call to action
+        k_g = max(k_g * 0.75, min(k_g, _MIN_PX[0] / min_font))
+    return k_g
+
 
 def _block_size(b: Block, k: float, col_w: float, max_h: float = 1e9):
     """Size of block at scale k inside a column of width col_w (or None if it can't fit)."""
@@ -333,11 +401,13 @@ def _block_size(b: Block, k: float, col_w: float, max_h: float = 1e9):
         vw, vh = max(v[2] - v[0], 0.05), max(v[3] - v[1], 0.05)
         s_ = min(k * _IMG_BOOST[0], max_h / max(b.h * vh, 1),
                  _CANVAS[1] / max(b.h, 1), _CANVAS[0] / max(b.w, 1))
-        return b.w * vw * s_, b.h * vh * s_, s_
+        bw_ = b.w * vw * s_
+        if b.sticker is not None:  # the slot is wide enough for the sticker riding on the product
+            bw_ = max(bw_, _sticker_box(b.sticker, b.st_scale)[0])
+        return bw_, b.h * vh * s_, s_
     # rigid groups (buttons, pills) may also grow past the type scale on banners
     # ...but only as far as needed to make their labels readable (hierarchy stays intact)
-    need = (_MIN_PX[0] * 1.15) / max(min([t["font_size"] for t in b.texts] or [1e9]), 1e-6)
-    k_g = max(k, min(k * 2.5, max_h / max(b.h, 1), need))
+    k_g = _group_scale(b, k, max_h)
     w, h = b.w * k_g, b.h * k_g
     if w > col_w + 0.5:
         k_g = k
@@ -365,7 +435,7 @@ def _edge_overflow(col, sizes, col_w, margin):
 
 def _fits(cols, k, W, H, gap, margin):
     """Check a column partition at scale k. Returns placement or None."""
-    avail_w = W - 2 * margin - gap * (len(cols) - 1)
+    avail_w = W - 2 * margin - _RESERVE[0] - _RESERVE[1] - gap * (len(cols) - 1)
     avail_h = H - 2 * margin
     if avail_w <= 0 or avail_h <= 0:
         return None
@@ -373,8 +443,7 @@ def _fits(cols, k, W, H, gap, margin):
     fixed = []
     for col in cols:
         fw = max([(_block_size(b, k, 1e9, avail_h)[0] if (b.images and not b.texts and not b.shapes)
-                   else b.w * max(k, min(k * 2.5, avail_h / max(b.h, 1),
-                                         (_MIN_PX[0] * 1.15) / max(min([t["font_size"] for t in b.texts] or [1e9]), 1e-6))))
+                   else b.w * _group_scale(b, k, avail_h))
                   for b in col if not b.flow_text] or [0])
         fixed.append(fw)
     flex_cols = [i for i, col in enumerate(cols) if any(b.flow_text for b in col)]
@@ -387,7 +456,8 @@ def _fits(cols, k, W, H, gap, margin):
                 sz = _block_size(b, k, 1e9, avail_h)
                 o = max(o, (b.w * sz[2] - max(fw_, sz[0])) / 2 - margin)
         return max(0.0, o)
-    rest -= _pre_over(cols[0], fixed[0]) + (_pre_over(cols[-1], fixed[-1]) if len(cols) > 1 else 0.0)
+    if len(cols) > 1:  # a single centred column only needs the box to fit the canvas
+        rest -= _pre_over(cols[0], fixed[0]) + _pre_over(cols[-1], fixed[-1])
     widths = list(fixed)
     if flex_cols:
         # give text columns a share proportional to their text mass
@@ -415,8 +485,8 @@ def _fits(cols, k, W, H, gap, margin):
         placed_cols.append((cw_, sizes, total_h))
     # the outer columns must leave room on the canvas for their images' invisible padding
     cw0 = [min(c, max(s[0] for s in sz) + 4) for c, (_, sz, _) in zip(widths, placed_cols)]
-    o_l = _edge_overflow(cols[0], placed_cols[0][1], cw0[0], margin)
-    o_r = _edge_overflow(cols[-1], placed_cols[-1][1], cw0[-1], margin)
+    o_l = _edge_overflow(cols[0], placed_cols[0][1], cw0[0], margin) if len(cols) > 1 else 0.0
+    o_r = _edge_overflow(cols[-1], placed_cols[-1][1], cw0[-1], margin) if len(cols) > 1 else 0.0
     if sum(cw0) + o_l + o_r > avail_w + 1:
         return None
     return widths, placed_cols
@@ -434,17 +504,21 @@ def _best_layout(blocks, W, H, src_scale_cap):
         return None
     margin = max(6.0, min(W, H) * 0.07, W * 0.015)
     gap = max(4.0, min(W, H) * 0.04)
+    if W / H >= 5:  # thin strips: give each piece clear breathing room
+        gap = max(gap, W * 0.022)
     best = None
     max_cols = min(n, 5)
     # supporting text: a text block directly under another text block in the source
     # (headline -> subhead) should stay in the same column.
     src_h = blocks[0].ch
     keep_pairs = [
-        i for i in range(n - 1)
+        (i, 0.85) for i in range(n - 1)
         if blocks[i].texts and blocks[i + 1].flow_text
         and 0 <= blocks[i + 1].y - (blocks[i].y + blocks[i].h) < 0.08 * src_h
         and abs((blocks[i].x + blocks[i].w / 2) - (blocks[i + 1].x + blocks[i + 1].w / 2)) < 0.15 * blocks[0].cw
     ]
+    # a badge attached to the product must stay with it
+    keep_pairs += [(i, 0.6) for i in range(n - 1) if blocks[i + 1].attach]
     # strongly wide canvases want more columns; tall canvases want 1
     ar = W / H
     for m in range(1, max_cols + 1):
@@ -474,13 +548,40 @@ def _best_layout(blocks, W, H, src_scale_cap):
     return k, cols, _fits(cols, k * 0.999, W, H, gap, margin), margin, gap
 
 
+def _alignment_mode(blocks, cw):
+    """How the original design lines its content up: 'left', 'right' or 'center'.
+    A design counts as edge-aligned when its text is mostly aligned that way AND several
+    units (text, pictures by their visible art, buttons) share that edge in the source."""
+    texts = [b for b in blocks if b.flow_text]
+    if not texts:
+        return "center"
+    aligns = [b.texts[0].get("text_align", "left") for b in texts]
+
+    def edges(side):
+        xs = []
+        for b in blocks:
+            v = b.vis or (0.0, 0.0, 1.0, 1.0)
+            if side == "left":
+                xs.append(b.x + v[0] * b.w)
+            else:
+                xs.append(b.x + v[2] * b.w)
+        tol = 0.025 * cw
+        return max(sum(1 for x2 in xs if abs(x2 - x1) <= tol) for x1 in xs)
+
+    for side in ("left", "right"):
+        n_side = sum(1 for a in aligns if a == side)
+        if n_side > len(aligns) / 2 and edges(side) >= 3:
+            return side
+    return "center"
+
+
 def _score_candidate(cols, part, k, m, W, H, gap, margin, keep_pairs):
     """Judge a candidate like a designer would, not just by size."""
     score = k * (1 - 0.02 * (m - 1))  # bigger is better; fewer columns break ties
     cuts = {a for a, _ in part[1:]}
-    for i in keep_pairs:  # headline + its supporting line split apart
+    for i, pen in keep_pairs:  # related units (headline + subhead, product + badge) split apart
         if (i + 1) in cuts:
-            score *= 0.85
+            score *= pen
     if m > 1:  # balanced columns read as intentional
         pl = _fits(cols, k * 0.999, W, H, gap, margin)
         if pl is not None:
@@ -502,6 +603,8 @@ def _place(b: Block, x, y, w, h, k, out: dict):
         t["font_size"] = max(1.0, round(t["font_size"] * k * b.tf, 2))
         return
     if b.vis is not None:
+        if b.sticker is None:
+            x += (w - (b.vis[2] - b.vis[0]) * b.w * k) / 2  # centre the art in its slot
         x -= b.vis[0] * b.w * k
         y -= b.vis[1] * b.h * k
     for e in b.els:
@@ -514,6 +617,103 @@ def _place(b: Block, x, y, w, h, k, out: dict):
             o["font_size"] = max(1.0, round(e["font_size"] * k, 2))
         if "corner_radius" in e and e["corner_radius"]:
             o["corner_radius"] = e["corner_radius"] * k
+
+
+def _strip_row(row, out, W, H, min_px):
+    """Thin strips read as one line: every piece shares the vertical centreline, the message
+    gets enough width to wrap into as few lines as possible, the product fills the strip's
+    height, and the button hugs its label. Applies only to one headline plus pictures and
+    buttons; anything else keeps the general layout."""
+    texts = [b for b in row if b.flow_text]
+    if len(texts) != 1 or len(row) < 2:
+        return
+    if any(not (b.flow_text or (b.vis is not None) or (b.is_group and b.texts and b.shapes)) for b in row):
+        return
+    snapshot = {e["id"]: dict(out[e["id"]]) for b in row for e in b.els}
+    pad_v = 0.1 * H
+    items = []  # (block, width, place_fn)
+    for b in row:
+        if b.vis is not None:  # picture: product fills the height, logo keeps its size
+            o = out[b.els[0]["id"]]
+            v = b.vis
+            if b.priority == 8.0:
+                s_ = (H - 2 * pad_v) / max((v[3] - v[1]) * b.h, 1e-6)
+                s_ = min(s_, H / max(b.h, 1e-6), W / max(b.w, 1e-6))
+            else:  # logo: a touch smaller so the message gets the width
+                s_ = 0.9 * o["width"] / max(b.w, 1e-6)
+            items.append([b, (v[2] - v[0]) * b.w * s_, s_])
+        elif b.is_group:  # button: label stays readable, the pill hugs it
+            lab = next(e for e in b.els if e["type"] == "text")
+            ol = out[lab["id"]]
+            fs = max(ol["font_size"], min(min_px, ol["font_size"]))
+            tw = _text_width(lab, fs, str(lab.get("content", "")))
+            items.append([b, tw + 2.0 * fs, fs])
+        else:
+            items.append([b, 0.0, None])
+    gap_min = 0.014 * W
+    fixed = sum(it[1] for it in items)
+
+    def edge(it, side):  # transparent padding of an end picture must stay on the canvas
+        b_, w_, s_ = it
+        if b_.vis is None:
+            return 0.0
+        v_ = b_.vis
+        return (v_[0] if side == 0 else 1 - v_[2]) * b_.w * s_
+    lead = max(gap_min, edge(items[0], 0))
+    tail = max(gap_min, edge(items[-1], 1))
+    lead = tail = max(lead, tail)  # equal visible safe margins on both ends
+    t = texts[0]
+    te = t.texts[0]
+    f0 = out[te["id"]]["font_size"]
+    best = None
+    f = f0
+    while f >= min_px - 1e-6:
+        room = W - fixed - gap_min * (len(items) - 1) - lead - tail
+        if room > 0:
+            n, widest = _wrap_lines(te, f, room - (f * 0.5 + 2))
+            hgt = n * f * float(te.get("line_height", LINE_HEIGHT))
+            if hgt <= H - 2 * 4 and widest + f * 0.5 + 2 <= room:
+                key = (n, -f)
+                if best is None or key < best[0]:
+                    best = (key, f, n, widest + f * 0.5 + 2, hgt)
+        f -= 0.25
+    if best is None:
+        return
+    _, fs_t, n_t, w_t, h_t = best
+    for it in items:
+        if it[0] is t:
+            it[1] = w_t
+    free = W - sum(it[1] for it in items) - lead - tail
+    g = gap_min + max(0.0, free - gap_min * (len(items) - 1)) / (len(items) + 1)
+    if free < gap_min * (len(items) - 1) - 0.5:
+        for k_, v_ in snapshot.items():
+            out[k_].update(v_)
+        return
+    x = lead + (g - gap_min)
+    cy = H / 2
+    for b, w_, extra in items:
+        if b is t:
+            o = out[te["id"]]
+            o.update({"x": x, "width": w_, "font_size": round(fs_t, 2),
+                      "height": h_t + fs_t * 0.25})
+            o["y"] = cy - o["height"] / 2
+        elif b.vis is not None:
+            s_ = extra
+            v = b.vis
+            o = out[b.els[0]["id"]]
+            o["width"], o["height"] = b.w * s_, b.h * s_
+            o["x"] = x - v[0] * o["width"]
+            o["y"] = cy - ((v[1] + v[3]) / 2) * o["height"]
+        else:
+            bg_ = next((e for e in b.els if e["type"] == "shape"), None)
+            for e in b.els:
+                o = out[e["id"]]
+                ocx = o["y"] + o["height"] / 2
+                o["x"], o["width"] = x, w_
+                o["y"] += cy - (out[bg_["id"]]["y"] + out[bg_["id"]]["height"] / 2) if bg_ else 0
+            if bg_ and out[bg_["id"]].get("corner_radius"):
+                out[bg_["id"]]["corner_radius"] = min(out[bg_["id"]]["corner_radius"], out[bg_["id"]]["height"] / 2)
+        x += w_ + g
 
 
 def _hide(e: dict, W, H):
@@ -620,12 +820,48 @@ def _reflow(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, 
 
     out = {e["id"]: copy.deepcopy(e) for e in source["elements"]}
     bgs, decos, blocks = _classify(source)
+    align_mode = _alignment_mode(blocks, cw)
+    # thin strips (leaderboards, mobile banners) read left to right in one line: the logo
+    # opens, the message follows, and the product sits right beside the call to action
+    sticker = None
+    if W / H >= 5:
+        hero = next((b for b in blocks if b.images and not b.texts and b.priority == 8.0), None)
+        cta = next((b for b in blocks if b.priority == 9.0 and b.is_group), None)
+
+        def rotated(b):
+            return any(abs(e.get("rotation", 0) or 0) > 1 for e in b.els)
+
+        # one clickable-looking shape per strip: other pills and badges step aside
+        for b in blocks:
+            if b.is_group and b.texts and b.shapes and b is not cta and not rotated(b):
+                b.dropped = b.forced = True
+        # a rotated promo sticker ("SUNSET SALE") rides on the product, like a price tag
+        st = next((b for b in blocks if b.is_group and b.texts and b.shapes and rotated(b)), None)
+        if st is not None:
+            fmin = max(min(t["font_size"] for t in st.texts), 1e-6)
+            sc = max(8.0, 0.8 * _min_readable(W, H)) / fmin
+            bw_, bh_ = _sticker_box(st, sc)
+            if STICKER_ON_STRIPS and bw_ <= 0.2 * W and bh_ <= 0.75 * H:
+                # it keeps the corner it had in the original design, like a corner flag
+                # it tucks into the bottom-right corner, overlapping the button's corner a little
+                st_right, st_top = True, False
+                st.st_scale, sticker = sc, st
+            blocks = [b for b in blocks if b is not st]
+            if sticker is None:
+                st.dropped = st.forced = True
+                blocks.append(st)
+        if hero is not None and cta is not None:
+            moving = [hero] + [b for b in blocks if b.attach]
+            rest = [b for b in blocks if b not in moving]
+            i = rest.index(cta)
+            blocks = rest[:i] + moving + rest[i:]
 
     # 1) background: full bleed, cover-crop
     for e in bgs:
         o = out[e["id"]]
         o.update({"x": 0, "y": 0, "width": W, "height": H})
-        o["fit"] = "cover"
+        if e["type"] == "image":
+            o["fit"] = "cover"
 
     # 2) content: search layouts, dropping lowest-priority blocks if text gets unreadable
     # never blow elements up beyond the overall change in canvas area
@@ -634,7 +870,10 @@ def _reflow(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, 
     _IMG_BOOST[0] = 2.0 if W / H >= 3 else 1.0
     _MIN_PX[0] = min_px
     _CANVAS[0], _CANVAS[1] = W, H
-    active = list(blocks)
+    _RESERVE[0] = _RESERVE[1] = 0.0
+    if sticker is not None:
+        _RESERVE[1 if st_right else 0] = 0.6 * _sticker_box(sticker, sticker.st_scale)[0]
+    active = [b for b in blocks if not b.dropped]
 
     def evaluate(act, tfac, relaxed=False):
         for b in act:
@@ -715,7 +954,7 @@ def _reflow(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, 
     # restore: hide only what truly can't fit. Try to bring each dropped unit back, most
     # important first; keep it if its text can be >= 8px and the headline / CTA lose
     # no more than 10% of their size or line length.
-    dropped = [b for b in blocks if b.dropped]
+    dropped = [b for b in blocks if b.dropped and not b.forced]
     if result is not None and dropped and ok:
         order = {id(b): i for i, b in enumerate(blocks)}
         cur = search(active)
@@ -759,11 +998,11 @@ def _reflow(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, 
         placed_cols = [(w_, s, t) for w_, (_, s, t) in zip(widths, placed_cols)]
         total_w = sum(widths) + gap * (len(cols) - 1)
         # distribute leftover horizontal space evenly between/around columns
-        free_w = W - 2 * margin - total_w
+        free_w = W - 2 * margin - _RESERVE[0] - _RESERVE[1] - total_w
         # even gaps between columns, capped so the composition stays a tight group;
         # whatever is left over becomes equal outer margins (group is centred)
-        o_l = _edge_overflow(cols[0], placed_cols[0][1], widths[0], margin)
-        o_r = _edge_overflow(cols[-1], placed_cols[-1][1], widths[-1], margin)
+        o_l = _edge_overflow(cols[0], placed_cols[0][1], widths[0], margin) if len(cols) > 1 else 0.0
+        o_r = _edge_overflow(cols[-1], placed_cols[-1][1], widths[-1], margin) if len(cols) > 1 else 0.0
         if len(cols) > 1:
             extra = min(free_w / (len(cols) + 1), max(gap * 1.5, W * 0.03),
                         max(0.0, (free_w - o_l - o_r) / (len(cols) - 1)))
@@ -771,18 +1010,34 @@ def _reflow(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, 
         else:
             extra, rest_ = 0.0, free_w
         lead = min(max(rest_ / 2, o_l), max(o_l, rest_ - o_r))
-        x = margin + lead
+        x = margin + _RESERVE[0] + lead
         for col, (col_w, sizes, total_h) in zip(cols, placed_cols):
             # vertical: spread blocks across available height (designed breathing room)
             avail_h = H - 2 * margin
             free_h = avail_h - total_h
+            # a headline and the smaller text line right under it read as one unit: keep them
+            # snug; the breathing room goes between the other pieces instead
+            tight = [i for i in range(len(col) - 1)
+                     if col[i].flow_text and col[i + 1].flow_text
+                     and col[i].max_font >= 1.2 * col[i + 1].max_font
+                     # ...only if they sat right against each other in the original design
+                     and col[i + 1].y - (col[i].y + col[i].h) < 0.03 * col[i].ch]
+            loose = len(col) - 1 - len(tight)
+            snug = gap * 0.6
             inner = gap * 0.6
-            if len(col) > 1 and free_h > 0:
-                inner += min(free_h / (len(col) + 1), gap * 2.5)
-            used = sum(s[1] for s in sizes) + inner * (len(col) - 1)
+            if loose and free_h > 0:
+                inner += min(free_h / (loose + 2), gap * 2.5)
+            gaps_ = [snug if i in tight else inner for i in range(len(col) - 1)]
+            used = sum(s[1] for s in sizes) + sum(gaps_)
             y = margin + (avail_h - used) / 2
-            for b, (bw, bh, bs) in zip(col, sizes):
-                bx = x + (col_w - bw) / 2  # center in column
+            for i_b, (b, (bw, bh, bs)) in enumerate(zip(col, sizes)):
+                inner = gaps_[i_b] if i_b < len(gaps_) else 0.0
+                if align_mode == "left":      # keep the original's shared left edge
+                    bx = x
+                elif align_mode == "right":   # ...or its shared right edge
+                    bx = x + col_w - bw
+                else:
+                    bx = x + (col_w - bw) / 2  # center in column
                 if b.flow_text:
                     # keep the full column width so text_align (center/left) behaves
                     bx_full = x if len(cols) == 1 or b.texts[0].get("text_align", "left") != "left" else x
@@ -808,8 +1063,106 @@ def _reflow(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, 
             o["width"], o["height"] = o["width"] * f, o["height"] * f
             o["x"], o["y"] = cx - o["width"] / 2, cy - o["height"] / 2
 
-    # 3) decorations: anchor to nearest corner, keep proportion, stay on canvas
+    # 3) decorations. A decoration that overlapped content in the source stays with that
+    #    content: full-width/height bands keep spanning the canvas behind the blocks they
+    #    covered; other shapes keep their spot relative to the element they sat behind.
+    def _src_box(b):
+        return b.x, b.y, b.w, b.h
+
+    def _out_box(b):
+        xs = [out[e["id"]] for e in b.els]
+        x0 = min(o_["x"] for o_ in xs); y0 = min(o_["y"] for o_ in xs)
+        x1 = max(o_["x"] + o_["width"] for o_ in xs); y1 = max(o_["y"] + o_["height"] for o_ in xs)
+        return x0, y0, x1 - x0, y1 - y0
+
+    def _ov(a, b):
+        ix = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+        iy = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+        return max(0.0, ix) * max(0.0, iy)
+
+    def _art_box(b):
+        x_, y_, w_, h_ = _out_box(b)
+        if b.vis is not None:
+            v = b.vis
+            return x_ + v[0] * w_, y_ + v[1] * h_, (v[2] - v[0]) * w_, (v[3] - v[1]) * h_
+        return x_, y_, w_, h_
+
+    live = [b for b in blocks if not b.dropped]
+    anchored = set()
     for e in decos:
+        if e["type"] != "shape" or k is None or not live:
+            continue
+        eb = (e["x"], e["y"], e["width"], e["height"])
+        o = out[e["id"]]
+        band_w = e["width"] >= 0.9 * cw
+        band_h = e["height"] >= 0.9 * ch
+        if band_w or band_h:
+            covered = [b for b in live if _ov(eb, _src_box(b)) >= 0.5 * max(b.w * b.h, 1e-6)]
+            if not covered:
+                continue
+            boxes = [_out_box(b) for b in covered]
+            pad = 0.04 * min(W, H)
+            if band_w:
+                y0 = max(0.0, min(bx[1] for bx in boxes) - pad)
+                y1 = min(H, max(bx[1] + bx[3] for bx in boxes) + pad)
+                if e["y"] + e["height"] >= ch - 2:   # band ran to the bottom edge: keep that
+                    y1 = H
+                if e["y"] <= 2:                      # ...or to the top edge
+                    y0 = 0.0
+                o.update({"x": 0.0, "y": y0, "width": W, "height": y1 - y0})
+            else:
+                x0 = max(0.0, min(bx[0] for bx in boxes) - pad)
+                x1 = min(W, max(bx[0] + bx[2] for bx in boxes) + pad)
+                if e["x"] + e["width"] >= cw - 2:
+                    x1 = W
+                if e["x"] <= 2:
+                    x0 = 0.0
+                o.update({"x": x0, "y": 0.0, "width": x1 - x0, "height": H})
+            anchored.add(e["id"])
+            continue
+        best_b, best_ov = None, 0.0
+        for b in live:
+            if b.flow_text:  # decorations belong behind pictures / buttons, never behind body text
+                continue
+            v = _ov(eb, _src_box(b))
+            if v > best_ov:
+                best_b, best_ov = b, v
+        if best_b is None:
+            continue
+        sx0, sy0, sw0, sh0 = _src_box(best_b)
+        ox0, oy0, ow0, oh0 = _out_box(best_b)
+        ka = ow0 / max(sw0, 1e-6)
+        # where the decoration's centre sat on its anchor (clamped to the anchor's box)
+        fx = min(1.0, max(0.0, (e["x"] + e["width"] / 2 - sx0) / max(sw0, 1e-6)))
+        fy = min(1.0, max(0.0, (e["y"] + e["height"] / 2 - sy0) / max(sh0, 1e-6)))
+        w_, h_ = e["width"] * ka, e["height"] * ka
+        f_ = min(1.0, W / max(w_, 1), H / max(h_, 1))
+        w_, h_ = w_ * f_, h_ * f_
+        # never behind the logo: slide toward the anchor's centre until the logo is clear
+        if best_b.vis is not None:  # a glow behind a picture is centred on the visible artwork
+            ab = _art_box(best_b)
+            fx = (ab[0] + ab[2] / 2 - ox0) / max(ow0, 1e-6)
+            fy = (ab[1] + ab[3] / 2 - oy0) / max(oh0, 1e-6)
+        logo_art = [_art_box(b) for b in live if b.priority >= 9.5 and b is not best_b]
+        for t_ in [i_ / 10 for i_ in range(11)]:
+            gx = fx + (0.5 - fx) * t_
+            gy = fy + (0.5 - fy) * t_
+            cand = (ox0 + gx * ow0 - w_ / 2, oy0 + gy * oh0 - h_ / 2, w_, h_)
+            if not any(_ov(cand, la) > 0 for la in logo_art):
+                break
+        # still touching the logo? shrink the glow about its centre until there is clear space
+        cx_, cy_ = cand[0] + w_ / 2, cand[1] + h_ / 2
+        f_ = 1.0
+        while f_ > 0.6 and any(_ov((cx_ - w_ * f_ / 2 - 6, cy_ - h_ * f_ / 2 - 6, w_ * f_ + 12, h_ * f_ + 12), la) > 0
+                               for la in logo_art):
+            f_ -= 0.05
+        w_, h_ = w_ * f_, h_ * f_
+        o.update({"width": w_, "height": h_, "x": cx_ - w_ / 2, "y": cy_ - h_ / 2})
+        anchored.add(e["id"])
+
+    for e in decos:
+        if e["id"] in anchored:
+            continue
         o = out[e["id"]]
         s = min(sx, sy) if k is None else max(min(sx, sy), min(k, 1.5 * min(sx, sy)))
         w, h = e["width"] * s, e["height"] * s
@@ -823,6 +1176,25 @@ def _reflow(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, 
         if e["type"] == "image" and not _asset_exists(e.get("asset_id", "")):
             # missing asset: keep it out of the way rather than show a placeholder box
             _hide_block([e], out, W, H)
+
+    if W / H >= 5 and result is not None:
+        _strip_row([b for b in blocks if not b.dropped], out, W, H, min_px)
+
+    if sticker is not None:
+        sc = sticker.st_scale
+        fw, fh = _sticker_box(sticker, sc)
+        inset = 0.04 * H
+        gx = (W - inset - fw / 2) if st_right else (inset + fw / 2)
+        gy = (inset + fh / 2) if st_top else (H - inset - fh / 2)
+        for e in sticker.els:
+            o = out[e["id"]]
+            o["width"], o["height"] = e["width"] * sc, e["height"] * sc
+            o["x"] = gx - sticker.w * sc / 2 + (e["x"] - sticker.x) * sc
+            o["y"] = gy - sticker.h * sc / 2 + (e["y"] - sticker.y) * sc
+            if e["type"] == "text":
+                o["font_size"] = max(1.0, e["font_size"] * sc)
+            if e.get("corner_radius"):
+                o["corner_radius"] = e["corner_radius"] * sc
 
     for o in out.values():
         _clamp(o, W, H)

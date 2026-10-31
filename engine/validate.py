@@ -32,10 +32,11 @@ def _visible(e: dict) -> bool:
 
 
 def _is_background(src: dict, canvas: dict) -> bool:
-    return src["type"] == "image" and (
-        src.get("fit") == "cover"
-        or src["width"] * src["height"] >= 0.85 * canvas["width"] * canvas["height"]
-    )
+    big = src["width"] * src["height"] >= 0.85 * canvas["width"] * canvas["height"]
+    if src["type"] == "image":
+        return src.get("fit") == "cover" or big
+    # a full-canvas solid fill or tint is a background too
+    return src["type"] == "shape" and big and not src.get("group_id")
 
 
 def hard_failures(source: dict, output: dict) -> list[str]:
